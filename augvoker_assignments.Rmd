@@ -1,0 +1,158 @@
+---
+title: "Automating Prescience Assignments for Augmentation Evokers"
+author: "John Zbaracki"
+date: "2023-11-05"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+library(tidyverse)
+library(fedmatch)   # clean_strings()
+```
+
+## The problem
+
+In World of Warcraft raiding, the Augmentation Evoker is a support specialization whose main job is buffing other players. Its key buff, *Prescience*, should go to whichever players will deal the most damage during each burst window (each cast of *Ebon Might*). With up to three Augmentation Evokers in a raid, each one needs a list of who to buff and when, and two Evokers should never buff the same player at overlapping times.
+
+Players data was collected from warcraft logs API and then damage in each window as calculated.
+
+This notebook automates the assignments. It takes a ranking of players by expected damage in each window, plus a schedule of Prescience casts, and assigns a target to every cast for all three Evokers without overlaps.
+
+This script allowed us to quickly evaluate performance and allocate accordingly.
+
+## Data
+
+Two inputs:
+
+- **`output.csv`**: For each burst window (`EM1`–`EM7`), a list of players ranked by expected damage, best first. - Taken from warcraftlogs and processed for damage windows.
+- **`EM_timings_New.csv`**: One row per Prescience cast, with the cast time, expiration time, the burst window it falls in, and an assignment priority (1 = fill first).
+
+```{r load-data}
+damage_data_original = read.csv('data/output.csv')
+em_timings = read.csv('data/EM_timings_New.csv')
+```
+
+
+Fix names
+
+```{r clean-names}
+damage_data = damage_data_original
+j = 1
+for(j in 1:length(damage_data$X)){
+  damage_data$X1[j] = str_to_title(clean_strings(str_split(damage_data$X1[j], ',')[[1]][1]))
+  damage_data$X2[j] = str_to_title(clean_strings(str_split(damage_data$X2[j], ',')[[1]][1]))
+  damage_data$X3[j] = str_to_title(clean_strings(str_split(damage_data$X3[j], ',')[[1]][1]))
+  damage_data$X4[j] = str_to_title(clean_strings(str_split(damage_data$X4[j], ',')[[1]][1]))
+  damage_data$X5[j] = str_to_title(clean_strings(str_split(damage_data$X5[j], ',')[[1]][1]))
+  damage_data$X6[j] = str_to_title(clean_strings(str_split(damage_data$X6[j], ',')[[1]][1]))
+  damage_data$X7[j] = str_to_title(clean_strings(str_split(damage_data$X7[j], ',')[[1]][1]))
+}
+
+colnames(damage_data) = c('PlayerNum', 'EM1', 'EM2', 'EM3','EM4', 'EM5', 'EM6', 'EM7')
+head(damage_data)
+```
+
+## Method
+
+Assignment is greedy. For each Prescience cast, the function:
+
+1. Finds every existing assignment (for any of the three Evokers) whose buff would overlap this cast's duration.
+2. Removes those players from this window's ranked list, along with anyone excluded entirely. This allows evokers to maintain current targets.
+3. Assigns the highest-ranked player left.
+
+Windows beyond the last ranked column fall back to the `EM7` ranking.
+
+```{r target-picker}
+TargetPickerFunction = function(EMWindow, CastTime, ExpirationTime, CurrentPrescienceAssigments, InputData, RemovedPlayers){
+
+  # Ranking column for this burst window; windows past the last column use EM7
+  EMColumn = paste0('EM', min(EMWindow, 7))
+
+  PossibleConflicts = CurrentPrescienceAssigments %>%
+    filter(Prescience_expiration_time >= CastTime & Prescience_Cast_time <= CastTime | Prescience_Cast_time <= ExpirationTime & Prescience_Cast_time >= CastTime)
+  ConflictList1 = PossibleConflicts$Augvoker_Set_1
+  ConflictList2 = PossibleConflicts$Augvoker_Set_2
+  ConflictList3 = PossibleConflicts$Augvoker_Set_3
+
+  Filtered_Target_List = InputData %>%
+    filter(.data[[EMColumn]] %in% ConflictList1 == "FALSE")
+  Filtered_Target_List = Filtered_Target_List %>%
+    filter(.data[[EMColumn]] %in% ConflictList2 == "FALSE")
+  Filtered_Target_List = Filtered_Target_List %>%
+    filter(.data[[EMColumn]] %in% ConflictList3 == "FALSE")
+  Filtered_Target_List = Filtered_Target_List %>%
+    filter(.data[[EMColumn]] %in% RemovedPlayers == "FALSE")
+
+  PrescienceTarget = Filtered_Target_List[[EMColumn]][1]
+  return(PrescienceTarget)
+}
+```
+
+Assignments are filled one Evoker at a time. Within each Evoker, higher-priority casts are filled first so they get first pick of the top players.
+
+```{r assign}
+DoNotInclude = c('Baldevoker')   # players never assigned Prescience
+
+for(SetColumn in c('Augvoker_Set_1', 'Augvoker_Set_2', 'Augvoker_Set_3')){
+  for(Priority in 1:5){
+    PriorityList = em_timings %>%
+      filter(Assignment_Priority == Priority)
+
+    for(j in seq_len(nrow(PriorityList))){
+      em_timings[[SetColumn]][PriorityList$Prescience_Number[j]] = TargetPickerFunction(PriorityList$Timing_window[j], PriorityList$Prescience_Cast_time[j], PriorityList$Prescience_expiration_time[j], em_timings, damage_data, DoNotInclude)
+    }
+  }
+}
+
+em_timings
+```
+
+
+## Output
+
+The final assignments are written out as text strings formatted for the Method Raid Tools Note, so the raid leader can paste them straight in.
+
+```{r export}
+em_timings.finished = em_timings %>%
+  mutate(Augvoker_Set_1 = paste0(Augvoker_Set_1, ' ')) %>%
+  mutate(Augvoker_Set_2 = paste0(Augvoker_Set_2, ' ')) %>%
+  mutate(Augvoker_Set_3 = paste0(Augvoker_Set_3, ' '))
+
+# TODO: In the original, Auglist2 repeats Set_1 and Auglist3/Auglist4 both use
+# Set_2, so Set_3 never reaches the export. Confirm which set belongs in each
+# string and update the column used in each loop below.
+
+Auglist1 = "startAug AugName("
+j = 1
+for(j in 1:length(em_timings.finished$Augvoker_Set_1)){
+  Auglist1 = paste0(Auglist1, em_timings.finished$Augvoker_Set_1[j])
+}
+Auglist1 = paste0(Auglist1, ') ')
+
+Auglist2 = " AugName ("
+j = 1
+for(j in 1:length(em_timings.finished$Augvoker_Set_1)){
+  Auglist2 = paste0(Auglist2, em_timings.finished$Augvoker_Set_1[j])
+}
+Auglist2 = paste0(Auglist2, ')endAug')
+
+Auglist3 = "Augvoker Start:"
+j = 1
+for(j in 1:length(em_timings.finished$Augvoker_Set_2)){
+  Auglist3 = paste0(Auglist3, em_timings.finished$Augvoker_Set_2[j])
+}
+
+Auglist4 = "Augvoker Start:"
+j = 1
+for(j in 1:length(em_timings.finished$Augvoker_Set_2)){
+  Auglist4 = paste0(Auglist4, em_timings.finished$Augvoker_Set_2[j])
+}
+
+AugFinal = data.frame(Auglist1, Auglist2, Auglist3, Auglist4)
+write.csv(AugFinal, file = "AugAssignments.csv", row.names = FALSE)
+```
+
+## Limitations and possible extensions
+
+This worked incredibly well. The important part was that augvokers pressed their button during the correct window for refreshing - if they were off on their timing, then desyncs happen. However, when all players played well - the results were excellent. 
